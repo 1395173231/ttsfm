@@ -14,3 +14,4 @@ pydub>=0.25.0
 # TTSFM package (install from local directory or PyPI)
 # For local development: pip install -e ../
 # For Docker/production: installed via pyproject.toml[web] dependencies
+curl-cffi>=0.10.0
