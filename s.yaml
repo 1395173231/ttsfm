@@ -23,6 +23,7 @@ services:
           - >-
             acs:fc:cn-hongkong:official:layers/Python310-Package-Collection/versions/2
           - acs:fc:cn-hongkong:official:layers/Python3-Flask2x/versions/2
+          - acs:fc:cn-hongkong:1188115197395810:layers/ttsfm/versions/1
         memorySize: 256
         cpu: 0.25
         timeout: 60
