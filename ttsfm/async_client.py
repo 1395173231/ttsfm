@@ -10,9 +10,8 @@ import uuid
 import asyncio
 import logging
 from typing import Optional, Dict, Any, Union, List
-
-import aiohttp
-from aiohttp import ClientTimeout, ClientSession
+from curl_cffi import requests  # 替换 aiohttp 导入
+from curl_cffi.requests import AsyncSession  # 用于异步会话
 
 from .models import (
     TTSRequest, TTSResponse, Voice, AudioFormat,
@@ -77,16 +76,15 @@ class AsyncTTSClient:
         self.verify_ssl = verify_ssl
         self.max_concurrent = max_concurrent
         
-        # Validate base URL
+        # 使用 curl-cffi 的 AsyncSession
+        self._session: Optional[AsyncSession] = None
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        
         if not validate_url(self.base_url):
             raise ValidationException(f"Invalid base URL: {self.base_url}")
         
-        # Session will be created when needed
-        self._session: Optional[ClientSession] = None
-        self._semaphore = asyncio.Semaphore(max_concurrent)
-        
         logger.info(f"Initialized async TTS client with base URL: {self.base_url}")
-    
+
     async def __aenter__(self):
         """Async context manager entry."""
         await self._ensure_session()
@@ -97,26 +95,19 @@ class AsyncTTSClient:
         await self.close()
     
     async def _ensure_session(self):
-        """Ensure HTTP session is created."""
-        if self._session is None or self._session.closed:
-            # Setup headers
+        """确保 HTTP 会话已创建"""
+        if self._session is None:
+            # 设置请求头
             headers = get_realistic_headers()
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
             
-            # Create timeout configuration
-            timeout = ClientTimeout(total=self.timeout)
-            
-            # Create session
-            connector = aiohttp.TCPConnector(
-                verify_ssl=self.verify_ssl,
-                limit=self.max_concurrent * 2
-            )
-            
-            self._session = ClientSession(
+            # 创建 curl-cffi 会话
+            self._session = AsyncSession(
                 headers=headers,
-                timeout=timeout,
-                connector=connector
+                timeout=self.timeout,
+                verify=self.verify_ssl,
+                impersonate="chrome"  # 模拟 Chrome 浏览器
             )
     
     async def generate_speech(
@@ -317,10 +308,10 @@ class AsyncTTSClient:
         """
         await self._ensure_session()
         
-        async with self._semaphore:  # Limit concurrent requests
+        async with self._semaphore:
             url = build_url(self.base_url, "api/generate")
-
-            # Prepare form data for openai.fm API
+            
+            # 准备表单数据
             form_data = {
                 'input': request.input,
                 'voice': request.voice.value,
@@ -328,11 +319,9 @@ class AsyncTTSClient:
                 'response_format': request.response_format.value if hasattr(request.response_format, 'value') else str(request.response_format)
             }
 
-            # Add prompt/instructions if provided
             if request.instructions:
                 form_data['prompt'] = request.instructions
             else:
-                # Default prompt for better quality
                 form_data['prompt'] = (
                     "Affect/personality: Natural and clear\n\n"
                     "Tone: Friendly and professional, creating a pleasant listening experience.\n\n"
@@ -345,71 +334,57 @@ class AsyncTTSClient:
 
             logger.info(f"Generating speech for text: '{request.input[:50]}...' with voice: {request.voice}")
 
-            # Make request with retries
+            # 使用 curl-cffi 发送请求
             for attempt in range(self.max_retries + 1):
                 try:
-                    # Add random delay for rate limiting (except first attempt)
                     if attempt > 0:
                         delay = exponential_backoff(attempt - 1)
                         logger.info(f"Retrying request after {delay:.2f}s (attempt {attempt + 1})")
                         await asyncio.sleep(delay)
 
-                    # Use form data as required by openai.fm
-                    async with self._session.post(url, data=form_data) as response:
-                        # Handle different response types
-                        if response.status == 200:
-                            return await self._process_openai_fm_response(response, request)
-                        else:
-                            # Try to parse error response
-                            try:
-                                error_data = await response.json()
-                            except (json.JSONDecodeError, ValueError):
-                                text = await response.text()
-                                error_data = {"error": {"message": text or "Unknown error"}}
-                            
-                            # Create appropriate exception
-                            exception = create_exception_from_response(
-                                response.status,
-                                error_data,
-                                f"TTS request failed with status {response.status}"
-                            )
-                            
-                            # Don't retry for certain errors
-                            if response.status in [400, 401, 403, 404]:
-                                raise exception
-                            
-                            # For retryable errors, continue to next attempt
-                            if attempt == self.max_retries:
-                                raise exception
-                            
-                            logger.warning(f"Request failed with status {response.status}, retrying...")
-                            continue
-                            
-                except asyncio.TimeoutError:
+                    response = await self._session.post(
+                        url,
+                        data=form_data,
+                        timeout=self.timeout
+                    )
+
+                    if response.status_code == 200:
+                        return await self._process_openai_fm_response(response, request)
+                    else:
+                        try:
+                            error_data = response.json()
+                        except (json.JSONDecodeError, ValueError):
+                            error_data = {"error": {"message": response.text or "Unknown error"}}
+                        
+                        exception = create_exception_from_response(
+                            response.status_code,
+                            error_data,
+                            f"TTS request failed with status {response.status_code}"
+                        )
+                        
+                        if response.status_code in [400, 401, 403, 404]:
+                            raise exception
+                        
+                        if attempt == self.max_retries:
+                            raise exception
+                        
+                        logger.warning(f"Request failed with status {response.status_code}, retrying...")
+                        continue
+                        
+                except (requests.RequestsError, asyncio.TimeoutError) as e:
                     if attempt == self.max_retries:
                         raise NetworkException(
-                            f"Request timed out after {self.timeout}s",
-                            timeout=self.timeout,
+                            f"Request error: {str(e)}",
                             retry_count=attempt
                         )
-                    logger.warning(f"Request timed out, retrying...")
-                    continue
-                    
-                except aiohttp.ClientError as e:
-                    if attempt == self.max_retries:
-                        raise NetworkException(
-                            f"Client error: {str(e)}",
-                            retry_count=attempt
-                        )
-                    logger.warning(f"Client error, retrying...")
+                    logger.warning(f"Request error, retrying...")
                     continue
             
-            # This should never be reached, but just in case
             raise TTSException("Maximum retries exceeded")
     
     async def _process_openai_fm_response(
         self,
-        response: aiohttp.ClientResponse,
+        response: requests.Response,
         request: TTSRequest
     ) -> TTSResponse:
         """
@@ -426,7 +401,7 @@ class AsyncTTSClient:
         content_type = response.headers.get("content-type", "audio/mpeg")
 
         # Get audio data
-        audio_data = await response.read()
+        audio_data = response.content  # curl-cffi 直接提供字节内容
 
         if not audio_data:
             raise APIException("Received empty audio data from openai.fm")
@@ -481,7 +456,7 @@ class AsyncTTSClient:
             duration=estimated_duration,
             metadata={
                 "response_headers": dict(response.headers),
-                "status_code": response.status,
+                "status_code": response.status_code,
                 "url": str(response.url),
                 "service": "openai.fm",
                 "voice": request.voice.value,

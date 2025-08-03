@@ -12,9 +12,7 @@ import logging
 from typing import Optional, Dict, Any, Union, List
 from urllib.parse import urljoin
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from curl_cffi import requests
 
 from .models import (
     TTSRequest, TTSResponse, Voice, AudioFormat,
@@ -82,28 +80,14 @@ class TTSClient:
         if not validate_url(self.base_url):
             raise ValidationException(f"Invalid base URL: {self.base_url}")
         
-        # Setup HTTP session with retry strategy
-        self.session = requests.Session()
-
-        # Configure retry strategy
-        retry_strategy = Retry(
-            total=max_retries,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "POST"],  # Updated parameter name
-            backoff_factor=1
+        # 创建 curl-cffi 会话
+        self.session = requests.Session(
+            headers=get_realistic_headers(),
+            timeout=self.timeout,
+            verify=self.verify_ssl,
+            impersonate="chrome"
         )
-
-        adapter = HTTPAdapter(
-            max_retries=retry_strategy,
-            pool_connections=10,
-            pool_maxsize=10
-        )
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-
-        # Set default headers
-        self.session.headers.update(get_realistic_headers())
-
+        
         if self.api_key:
             self.session.headers["Authorization"] = f"Bearer {self.api_key}"
         
@@ -311,8 +295,8 @@ class TTSClient:
             TTSException: If request fails
         """
         url = build_url(self.base_url, "api/generate")
-
-        # Prepare form data for openai.fm API
+        
+        # 准备表单数据
         form_data = {
             'input': request.input,
             'voice': request.voice.value,
@@ -352,22 +336,16 @@ class TTSClient:
         # Make request with retries
         for attempt in range(self.max_retries + 1):
             try:
-                # Add random delay for rate limiting (except first attempt)
                 if attempt > 0:
                     delay = exponential_backoff(attempt - 1)
-                    logger.info(f"Retrying request after {delay:.2f}s (attempt {attempt + 1})")
                     time.sleep(delay)
 
-                # Use multipart form data as required by openai.fm
                 response = self.session.post(
                     url,
                     data=form_data,
-                    headers=format_headers,
-                    timeout=self.timeout,
-                    verify=self.verify_ssl
+                    timeout=self.timeout
                 )
                 
-                # Handle different response types
                 if response.status_code == 200:
                     return self._process_openai_fm_response(response, request)
                 else:
@@ -395,35 +373,11 @@ class TTSClient:
                     logger.warning(f"Request failed with status {response.status_code}, retrying...")
                     continue
                     
-            except requests.exceptions.Timeout:
+            except requests.RequestsError as e:
                 if attempt == self.max_retries:
-                    raise NetworkException(
-                        f"Request timed out after {self.timeout}s",
-                        timeout=self.timeout,
-                        retry_count=attempt
-                    )
-                logger.warning(f"Request timed out, retrying...")
+                    raise NetworkException(str(e), retry_count=attempt)
                 continue
-                
-            except requests.exceptions.ConnectionError as e:
-                if attempt == self.max_retries:
-                    raise NetworkException(
-                        f"Connection error: {str(e)}",
-                        retry_count=attempt
-                    )
-                logger.warning(f"Connection error, retrying...")
-                continue
-                
-            except requests.exceptions.RequestException as e:
-                if attempt == self.max_retries:
-                    raise NetworkException(
-                        f"Request error: {str(e)}",
-                        retry_count=attempt
-                    )
-                logger.warning(f"Request error, retrying...")
-                continue
-        
-        # This should never be reached, but just in case
+
         raise TTSException("Maximum retries exceeded")
     
     def _process_openai_fm_response(self, response: requests.Response, request: TTSRequest) -> TTSResponse:
